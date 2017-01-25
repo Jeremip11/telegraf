@@ -2,6 +2,7 @@ package jolokia
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -47,16 +48,29 @@ func (c JolokiaClientImpl) MakeRequest(req *http.Request) (*http.Response, error
 }
 
 type Jolokia struct {
-	jClient   JolokiaClient
-	Context   string
-	Mode      string
-	Servers   []Server
-	Metrics   []Metric
-	Proxy     Server
-	Delimiter string
+	jClient               JolokiaClient
+	Context               string
+	Mode                  string
+	Servers               []Server
+	Metrics               []Metric
+	Proxy                 Server
+	Delimiter             string
+
+	UseHTTPS              bool `toml:"https"`
+	SSLCA                 string `toml:"ssl_ca"`
+	// Path to host cert file
+	SSLCert               string `toml:"ssl_cert"`
+	// Path to cert key file
+	SSLKey                string `toml:"ssl_key"`
+	// Use SSL but skip chain & host verification
+	InsecureSkipVerify    bool
+
+	JMXAuthHeader           string `toml:"jmx_auth"`
 
 	ResponseHeaderTimeout internal.Duration `toml:"response_header_timeout"`
 	ClientTimeout         internal.Duration `toml:"client_timeout"`
+
+	tlsConfig             tls.Config
 }
 
 const sampleConfig = `
@@ -64,6 +78,15 @@ const sampleConfig = `
   ## NOTE that Jolokia requires a trailing slash at the end of the context root
   ## NOTE that your jolokia security policy must allow for POST requests.
   context = "/jolokia/"
+
+  ## SSL connection setting
+  # ssl_ca = "~/.ssh/ca.pem" file with ca certificate
+  # ssl_cert "~/.ssh/crt.pem" file with certificate
+  # ssl_key "~/.ssh/key.pem" file with .pem encoded private key
+  # https = false
+
+  ## JMX authentication settings
+  # jmx_auth_header = "hello authenticate me" header to authenticate in backends
 
   ## This specifies the mode used
   # mode = "proxy"
@@ -222,7 +245,11 @@ func (j *Jolokia) prepareRequest(server Server, metric Metric) (*http.Request, e
 		jolokiaUrl = proxyUrl
 
 	} else {
-		serverUrl, err := url.Parse("http://" + server.Host + ":" + server.Port + context)
+		var protocol = "http://"
+		if (j.UseHTTPS) {
+			protocol = "https://"
+		}
+		serverUrl, err := url.Parse(protocol + server.Host + ":" + server.Port + context)
 		if err != nil {
 			return nil, err
 		}
@@ -241,6 +268,9 @@ func (j *Jolokia) prepareRequest(server Server, metric Metric) (*http.Request, e
 		return nil, err
 	}
 
+	if (j.JMXAuthHeader != "") {
+		req.Header.Add("Authorization", j.JMXAuthHeader)
+	}
 	req.Header.Add("Content-type", "application/json")
 
 	return req, nil
@@ -249,7 +279,7 @@ func (j *Jolokia) prepareRequest(server Server, metric Metric) (*http.Request, e
 func (j *Jolokia) extractValues(measurement string, value interface{}, fields map[string]interface{}) {
 	if mapValues, ok := value.(map[string]interface{}); ok {
 		for k2, v2 := range mapValues {
-			j.extractValues(measurement+j.Delimiter+k2, v2, fields)
+			j.extractValues(measurement + j.Delimiter + k2, v2, fields)
 		}
 	} else {
 		fields[measurement] = value
@@ -259,7 +289,21 @@ func (j *Jolokia) extractValues(measurement string, value interface{}, fields ma
 func (j *Jolokia) Gather(acc telegraf.Accumulator) error {
 
 	if j.jClient == nil {
-		tr := &http.Transport{ResponseHeaderTimeout: j.ResponseHeaderTimeout.Duration}
+		var tr *http.Transport
+		if (j.SSLKey != "" && j.SSLCert != "") {
+			tlsConfig, err := internal.GetTLSConfig(
+				j.SSLCert, j.SSLKey, j.SSLCA, j.InsecureSkipVerify)
+			if (err != nil) {
+				return err;
+			}
+			tr = &http.Transport{
+				ResponseHeaderTimeout: j.ResponseHeaderTimeout.Duration,
+				TLSClientConfig:tlsConfig,
+			}
+		} else {
+			tr = &http.Transport{ResponseHeaderTimeout: j.ResponseHeaderTimeout.Duration}
+		}
+
 		j.jClient = &JolokiaClientImpl{&http.Client{
 			Transport: tr,
 			Timeout:   j.ClientTimeout.Duration,
