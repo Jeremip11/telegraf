@@ -1,0 +1,8 @@
+version: '2'
+services:
+  build:
+    image: golang:1.7.4
+    volumes:
+      - .:/go/src/github.com/influxdata/telegraf
+    working_dir: /go/src/github.com/influxdata/telegraf
+    command: ./build.sh
