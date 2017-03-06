@@ -2,6 +2,7 @@ package jolokia
 
 import (
 	"bytes"
+	"strings"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
@@ -29,10 +30,11 @@ type Server struct {
 }
 
 type Metric struct {
-	Name      string
-	Mbean     string
-	Attribute string
-	Path      string
+	Name              string
+	Mbean             string
+	TagsFromMbean     []string
+	Attribute         string
+	Path              string
 }
 
 type JolokiaClient interface {
@@ -276,14 +278,84 @@ func (j *Jolokia) prepareRequest(server Server, metric Metric) (*http.Request, e
 	return req, nil
 }
 
-func (j *Jolokia) extractValues(measurement string, value interface{}, fields map[string]interface{}) {
+func (j *Jolokia) parseTags(
+	mbean string, tagNames []string, defaultTags map[string]string,
+) (map[string]string, error) {
+	tags := make(map[string]string)
+	for k, v := range defaultTags {
+		tags[k] = v
+	}
+
+	parts := strings.Split(mbean, ":")
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("There should be exactly 1 colon in MBean name")
+	}
+
+	for _, tag := range tagNames {
+		if tag == "*domain" {
+			tags["_domain"] = parts[0]
+		}
+	}
+
+	path := strings.Split(parts[1], ",")
+	for _, kv := range path {
+		props := strings.Split(kv, "=")
+		if (len(props) != 2) {
+			return nil, fmt.Errorf("Incorrect format of MBean name\n")
+		} else {
+			for _, tag := range tagNames {
+				if tag == props[0] {
+					tags[strings.TrimSpace(tag)] = props[1]
+				}
+			}
+		}
+	}
+
+	return tags, nil
+}
+
+func (j *Jolokia) extractValues(key string, value interface{}, fields map[string]interface{}) {
 	if mapValues, ok := value.(map[string]interface{}); ok {
 		for k2, v2 := range mapValues {
-			j.extractValues(measurement + j.Delimiter + k2, v2, fields)
+			j.extractValues(key + j.Delimiter + k2, v2, fields)
 		}
 	} else {
-		fields[measurement] = value
+		fields[key] = value
 	}
+}
+
+func (j* Jolokia) extractMetric(
+	input map[string]interface{}, metric Metric, defaultTags map[string]string,
+	acc telegraf.Accumulator,
+) error {
+	measurement := "jolokia";
+
+	if values, ok := input["value"]; ok {
+		if len(metric.TagsFromMbean) == 0 {
+			fields := make(map[string]interface{})
+			j.extractValues(metric.Name, values, fields)
+			acc.AddFields(measurement, fields, defaultTags)
+		} else {
+			if mapValues, ok := values.(map[string]interface{}); ok {
+				for k, v := range mapValues {
+					fields := make(map[string]interface{})
+					tags, err := j.parseTags(k, metric.TagsFromMbean, defaultTags)
+					if (err != nil) {
+						fmt.Printf("Failed to parse tags: %s", err)
+					} else {
+						j.extractValues(metric.Name, v, fields)
+						acc.AddFields(measurement, fields, tags)
+					}
+				}
+			} else {
+				return fmt.Errorf("There was no MBean name in output response\n")
+			}
+		}
+	} else {
+		return fmt.Errorf("Missing key 'value' in output response\n")
+	}
+
+	return nil
 }
 
 func (j *Jolokia) Gather(acc telegraf.Accumulator) error {
@@ -312,17 +384,14 @@ func (j *Jolokia) Gather(acc telegraf.Accumulator) error {
 
 	servers := j.Servers
 	metrics := j.Metrics
-	tags := make(map[string]string)
+	defaultTags := make(map[string]string)
 
 	for _, server := range servers {
-		tags["jolokia_name"] = server.Name
-		tags["jolokia_port"] = server.Port
-		tags["jolokia_host"] = server.Host
-		fields := make(map[string]interface{})
+		defaultTags["jolokia_name"] = server.Name
+		defaultTags["jolokia_port"] = server.Port
+		defaultTags["jolokia_host"] = server.Host
 
 		for _, metric := range metrics {
-			measurement := metric.Name
-
 			req, err := j.prepareRequest(server, metric)
 			if err != nil {
 				return err
@@ -333,16 +402,9 @@ func (j *Jolokia) Gather(acc telegraf.Accumulator) error {
 			if err != nil {
 				fmt.Printf("Error handling response: %s\n", err)
 			} else {
-				if values, ok := out["value"]; ok {
-					j.extractValues(measurement, values, fields)
-				} else {
-					fmt.Printf("Missing key 'value' in output response\n")
-				}
-
+				j.extractMetric(out, metric, defaultTags, acc)
 			}
 		}
-
-		acc.AddFields("jolokia", fields, tags)
 	}
 
 	return nil
