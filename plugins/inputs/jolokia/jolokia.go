@@ -30,6 +30,7 @@ type Server struct {
 }
 
 type Metric struct {
+	InputNameOverride string
 	Name              string
 	Mbean             string
 	TagsFromMbean     []string
@@ -329,6 +330,9 @@ func (j* Jolokia) extractMetric(
 	acc telegraf.Accumulator,
 ) error {
 	measurement := "jolokia";
+	if metric.InputNameOverride != "" {
+		measurement = metric.InputNameOverride
+	}
 
 	if values, ok := input["value"]; ok {
 		if len(metric.TagsFromMbean) == 0 {
