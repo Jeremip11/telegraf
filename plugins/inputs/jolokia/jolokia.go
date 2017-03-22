@@ -16,6 +16,8 @@ import (
 	"github.com/influxdata/telegraf/internal"
 	"github.com/influxdata/telegraf/plugins/inputs"
 	"os"
+	"syscall"
+	"strconv"
 )
 
 // Default http timeouts
@@ -28,6 +30,7 @@ type Server struct {
 	Username string
 	Password string
 	Port     string
+	WrapperPidFile string
 }
 
 type Metric struct {
@@ -70,8 +73,6 @@ type Jolokia struct {
 	// Use SSL but skip chain & host verification
 	InsecureSkipVerify    bool
 
-	DynamicServersFile    string  `toml:"active_servers_file"`
-
 	JMXAuthHeader         string `toml:"jmx_auth"`
 
 	ResponseHeaderTimeout internal.Duration `toml:"response_header_timeout"`
@@ -91,10 +92,6 @@ const sampleConfig = `
   # ssl_cert "~/.ssh/crt.pem" file with certificate
   # ssl_key "~/.ssh/key.pem" file with .pem encoded private key
   # https = false
-
-  ## Dynamic servers config. Used for single jvm hosts, or to disable false alerts on time on scheduled stops
-  ## To enable server monitoring add line '${server.port}=active' to that file
-  #active_servers_file = "~/servers.properties"
 
   ## JMX authentication settings
   # jmx_auth_header = "hello authenticate me" header to authenticate in backends
@@ -133,6 +130,8 @@ const sampleConfig = `
     port = "8080"
     # username = "myuser"
     # password = "mypassword"
+    ## Server metrics will be gathered only if process with id from wrapper.pid file exists
+    # wrapperPidFile = "/home/service/wrapper.pid"
 
   ## List of metrics collected on above servers
   ## Each metric consists in a name, a jmx path and either
@@ -394,7 +393,7 @@ func (j *Jolokia) Gather(acc telegraf.Accumulator) error {
 		}}
 	}
 
-	servers := getActiveServers(&j.Servers, j.DynamicServersFile)
+	servers := getActiveServers(&j.Servers)
 	metrics := j.Metrics
 	defaultTags := make(map[string]string)
 
@@ -422,34 +421,42 @@ func (j *Jolokia) Gather(acc telegraf.Accumulator) error {
 	return nil
 }
 
-func getActiveServers(servers *[]Server, fileName string) []Server {
-	if (fileName != "") {
-		file, err := os.Open(fileName)
-		if err != nil {
-			fmt.Printf("Failed to read active servers configuration file: %s\n", err)
-			return *servers
-		}
-		defer file.Close()
-		serversState := make(map[string]bool)
-		scanner := bufio.NewScanner(file)
-		for scanner.Scan() {
-			parts := strings.Split(scanner.Text(), "=")
-			if (len(parts) != 2) {
-				fmt.Printf("Wrong format of active servers conf file: %s\n", scanner.Text())
-				return *servers
+func getActiveServers(servers *[]Server) []Server {
+	result := make([]Server, 0)
+	for _, server := range *servers {
+		if (server.WrapperPidFile == ""){
+			result = append(result, server)
+		} else {
+			file, err := os.Open(server.WrapperPidFile)
+			if err != nil {
+				continue
 			}
-			serversState[parts[0]] = (parts[1] == "active")
-		}
-		result := make([]Server, 0)
-		for _, server := range *servers {
-			if (true == serversState[server.Port]) {
+			scanner := bufio.NewScanner(file)
+			if (!scanner.Scan()) {
+				continue
+			}
+			pidString := scanner.Text()
+			pid, err :=  strconv.ParseInt(pidString, 10, 64)
+			if err != nil {
+				fmt.Printf("Failed to parse pid file: %s\n", err)
+				continue
+			}
+			if (isProcessExists(int(pid))) {
 				result = append(result, server)
 			}
 		}
-		return result
+	}
+	return result
+}
 
+func isProcessExists(pid int) bool{
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		fmt.Printf("Failed to find process: %s\n", err)
+		return false
 	} else {
-		return *servers
+		err := process.Signal(syscall.Signal(0))
+		return err == nil
 	}
 }
 
