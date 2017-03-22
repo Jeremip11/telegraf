@@ -11,10 +11,11 @@ import (
 	"net/http"
 	"net/url"
 	"time"
-
+	"bufio"
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/internal"
 	"github.com/influxdata/telegraf/plugins/inputs"
+	"os"
 )
 
 // Default http timeouts
@@ -54,6 +55,7 @@ type Jolokia struct {
 	jClient               JolokiaClient
 	Context               string
 	Mode                  string
+
 	Servers               []Server
 	Metrics               []Metric
 	Proxy                 Server
@@ -68,7 +70,9 @@ type Jolokia struct {
 	// Use SSL but skip chain & host verification
 	InsecureSkipVerify    bool
 
-	JMXAuthHeader           string `toml:"jmx_auth"`
+	DynamicServersFile    string  `toml:"active_servers_file"`
+
+	JMXAuthHeader         string `toml:"jmx_auth"`
 
 	ResponseHeaderTimeout internal.Duration `toml:"response_header_timeout"`
 	ClientTimeout         internal.Duration `toml:"client_timeout"`
@@ -87,6 +91,10 @@ const sampleConfig = `
   # ssl_cert "~/.ssh/crt.pem" file with certificate
   # ssl_key "~/.ssh/key.pem" file with .pem encoded private key
   # https = false
+
+  ## Dynamic servers config. Used for single jvm hosts, or to disable false alerts on time on scheduled stops
+  ## To enable server monitoring add line '${server.port}=active' to that file
+  #active_servers_file = "~/servers.properties"
 
   ## JMX authentication settings
   # jmx_auth_header = "hello authenticate me" header to authenticate in backends
@@ -386,7 +394,7 @@ func (j *Jolokia) Gather(acc telegraf.Accumulator) error {
 		}}
 	}
 
-	servers := j.Servers
+	servers := getActiveServers(&j.Servers, j.DynamicServersFile)
 	metrics := j.Metrics
 	defaultTags := make(map[string]string)
 
@@ -412,6 +420,37 @@ func (j *Jolokia) Gather(acc telegraf.Accumulator) error {
 	}
 
 	return nil
+}
+
+func getActiveServers(servers *[]Server, fileName string) []Server {
+	if (fileName != "") {
+		file, err := os.Open(fileName)
+		if err != nil {
+			fmt.Printf("Failed to read active servers configuration file: %s\n", err)
+			return *servers
+		}
+		defer file.Close()
+		serversState := make(map[string]bool)
+		scanner := bufio.NewScanner(file)
+		for scanner.Scan() {
+			parts := strings.Split(scanner.Text(), "=")
+			if (len(parts) != 2) {
+				fmt.Printf("Wrong format of active servers conf file: %s\n", scanner.Text())
+				return *servers
+			}
+			serversState[parts[0]] = (parts[1] == "active")
+		}
+		result := make([]Server, 0)
+		for _, server := range *servers {
+			if (true == serversState[server.Port]) {
+				result = append(result, server)
+			}
+		}
+		return result
+
+	} else {
+		return *servers
+	}
 }
 
 func init() {
